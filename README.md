@@ -45,34 +45,27 @@ If the connection to your router or the internet is lost, it:
 
 ## 🛠️ Installation
 
-### 1. Install dependencies
-Most are preinstalled on Raspberry Pi OS, but run this to be safe:
+### Quick install or update (recommended)
+Run the installer as root (or via `sudo`). It will install/update the script **and** refresh the systemd service file automatically.
+
+```bash
+sudo ./install.sh           # fresh install
+sudo ./install.sh --update  # update existing install and restart the service
+```
+
+By default the installer also installs dependencies (`iw` and `wireless-tools`). Add `--skip-deps` to skip that step if you manage packages yourself.
+
+### Manual installation (if you prefer)
 ```bash
 sudo apt-get update
 sudo apt-get install -y iw wireless-tools
-```
-
-### 2. Install the watchdog script
-Copy the script into place and make it executable:
-```bash
 sudo install -Dm755 wifi_auto_recover.sh /usr/local/bin/wifi_auto_recover.sh
-```
-
-### 3. Install the systemd service unit
-Copy the provided unit file and reload systemd:
-```bash
 sudo install -Dm644 systemd/wifi-auto-recover.service /etc/systemd/system/wifi-auto-recover.service
 sudo systemctl daemon-reload
-```
-
-### 4. Enable and start the service
-```bash
 sudo systemctl enable --now wifi-auto-recover.service
 ```
 
-The service will now start at boot and recover Wi-Fi automatically.
-
-### 5. Check connectivity status on demand
+### Check connectivity status on demand
 You can run the script directly with `--status` to query the last known state and current connectivity in one shot:
 ```bash
 sudo /usr/local/bin/wifi_auto_recover.sh --status
