@@ -35,7 +35,9 @@ detect_iface() {
 IFACE="$(detect_iface "${1:-}")"
 
 log() {
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [wifi-auto-recover] $*" | tee -a /var/log/wifi_auto_recover.log
+  local line
+  line="$(date '+%Y-%m-%d %H:%M:%S') [wifi-auto-recover] $*"
+  echo "$line" | tee -a /var/log/wifi_auto_recover.log "$HOME_LOG"
 }
 
 userlog() {
@@ -104,16 +106,39 @@ cycle_wifi() {
 }
 
 report_status() {
-  local ssid ipaddr
+  local ssid ipaddr link_info bssid signal freq tx_bitrate default_route_status dns_status
+  default_route_status="$1"
+  dns_status="$2"
   ssid="$(iwgetid -r 2>/dev/null || echo '?')"
   ipaddr="$(ip -4 addr show dev "$IFACE" | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)"
-  log "Status: SSID=${ssid}, IP=${ipaddr:-none}"
+  link_info="$(iw dev "$IFACE" link 2>/dev/null || true)"
+  bssid="$(awk '/Connected to/ {print $3; exit}' <<<"$link_info")"
+  signal="$(awk -F'signal: ' '/signal:/ {print $2; exit}' <<<"$link_info" | sed 's/ dBm//')"
+  freq="$(awk '/freq:/ {print $2; exit}' <<<"$link_info")"
+  tx_bitrate="$(awk -F'tx bitrate: ' '/tx bitrate:/ {print $2; exit}' <<<"$link_info")"
+
+  bssid="${bssid:-none}"
+  signal="${signal:-unknown}"
+  freq="${freq:-unknown}"
+  tx_bitrate="${tx_bitrate:-unknown}"
+  log "Status: SSID=${ssid}, BSSID=${bssid}, Signal=${signal} dBm, Freq=${freq} MHz, TX=${tx_bitrate}, IP=${ipaddr:-none}, DefaultRoute=${default_route_status}, DNS=${dns_status}"
 }
 
 main() {
   log "Starting WiFi Auto-Recover on interface: $IFACE"
   disable_powersave
-  report_status
+  local initial_dns_status="disabled" initial_route_status="no"
+  if check_default_route; then
+    initial_route_status="yes"
+  fi
+  if [[ "$ENABLE_DNS_CHECK" -eq 1 ]]; then
+    if check_dns; then
+      initial_dns_status="yes"
+    else
+      initial_dns_status="no"
+    fi
+  fi
+  report_status "$initial_route_status" "$initial_dns_status"
 
   local fails=0
   local recovery_start=0
@@ -122,21 +147,41 @@ main() {
   local detail=""
 
   while true; do
+    local default_route_ok=0
+    local default_route_status="no"
+    local dns_status="disabled"
+    state="ok"
     detail="Connectivity verified."
+
     if ! check_association; then
       state="no_wifi"
       detail="WiFi not associated on $IFACE (iw dev link)."
-    elif ! check_default_route; then
+    fi
+
+    if check_default_route; then
+      default_route_ok=1
+      default_route_status="yes"
+    fi
+
+    if [[ "$state" == "ok" && $default_route_ok -eq 0 ]]; then
       state="no_internet"
       detail="No default route via $IFACE."
-    elif ! check_ping_hosts; then
+    elif [[ "$state" == "ok" ]] && ! check_ping_hosts; then
       state="no_internet"
       detail="${PING_FAILURE_DETAIL:-Ping check failed.}"
-    elif [[ "$ENABLE_DNS_CHECK" -eq 1 ]] && ! check_dns; then
-      state="no_internet"
-      detail="${DNS_FAILURE_DETAIL:-DNS check failed.}"
+    fi
+
+    if [[ "$ENABLE_DNS_CHECK" -eq 1 ]]; then
+      dns_status="no"
+      if check_dns; then
+        dns_status="yes"
+      fi
+      if [[ "$state" == "ok" && "$dns_status" != "yes" ]]; then
+        state="no_internet"
+        detail="${DNS_FAILURE_DETAIL:-DNS check failed.}"
+      fi
     else
-      state="ok"
+      dns_status="disabled"
     fi
 
     if [[ "$state" == "ok" ]]; then
@@ -146,7 +191,7 @@ main() {
         local duration=$((recovery_end - recovery_start))
         userlog "Recovered connection on $IFACE after ${duration}s."
         log "✅ Connectivity restored after ${duration}s."
-        report_status
+        report_status "$default_route_status" "$dns_status"
         recovery_start=0
       fi
       fails=0
@@ -159,7 +204,7 @@ main() {
         fails=1
       fi
       log "Connectivity state=${state} (${fails}/${MAX_FAILS}): ${detail}"
-      report_status
+      report_status "$default_route_status" "$dns_status"
 
       if (( fails >= MAX_FAILS )); then
         if (( recovery_start == 0 )); then
