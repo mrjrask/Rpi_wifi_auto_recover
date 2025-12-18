@@ -72,6 +72,13 @@ sudo systemctl enable --now wifi-auto-recover.service
 
 The service will now start at boot and recover Wi-Fi automatically.
 
+### 5. Check connectivity status on demand
+You can run the script directly with `--status` to query the last known state and current connectivity in one shot:
+```bash
+sudo /usr/local/bin/wifi_auto_recover.sh --status
+```
+The status output includes the current SSID, IP address, and the last recorded recovery duration, if available.
+
 ---
 
 ## ✅ Verifying operation
@@ -99,3 +106,14 @@ The service will now start at boot and recover Wi-Fi automatically.
   ```
 
 If problems persist, inspect `journalctl -u wifi-auto-recover.service` for detailed error messages.
+
+---
+
+## 🔧 Configuration and tips
+
+- **Select a specific interface:** Set `WIFI_INTERFACE=wlan1` (or pass `wlan1` as a positional argument) if your Pi has multiple Wi-Fi adapters.
+- **Custom log location:** Point `WIFI_RECOVERY_LOG=/path/to/log` to change the per-user log destination.
+- **DNS checking:** The script performs a DNS resolution check by default. Set `ENABLE_DNS_CHECK=0` to disable it if you are on a captive portal or a network with restricted DNS.
+- **Permission-less pings:** If binding pings to an interface fails (e.g., due to permissions), the script automatically retries without binding to keep connectivity checks resilient.
+
+> Tip: To avoid lock conflicts, ensure only one instance of the script runs at a time. The systemd unit already enforces this via a lock file.
