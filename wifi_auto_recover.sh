@@ -18,6 +18,12 @@ ENABLE_DNS_CHECK=${ENABLE_DNS_CHECK:-1}  # set to 0 to skip DNS resolution check
 
 HOME_LOG="${HOME}/wifi_recovery.log"
 
+LOCK_FILE="/var/lock/wifi_auto_recover.lock"
+LOCK_FALLBACK="${HOME}/.wifi_auto_recover.lock"
+LOCK_FD=200
+LOCK_HELD=0
+should_run=1
+
 detect_iface() {
   if [[ $# -gt 0 && -n "${1:-}" ]]; then
     echo "$1"
@@ -42,6 +48,42 @@ log() {
 
 userlog() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') [wifi-recovery] $*" >> "$HOME_LOG"
+}
+
+on_signal() {
+  local sig=$1
+  should_run=0
+  log "Received ${sig}; stopping monitoring loop."
+}
+
+cleanup() {
+  if (( LOCK_HELD )); then
+    flock -u "$LOCK_FD" || true
+    rm -f "$LOCK_FILE" || true
+    log "WiFi Auto-Recover stopped."
+  fi
+}
+
+select_lock_file() {
+  local dir
+  dir="$(dirname "$LOCK_FILE")"
+  if [[ ! -d "$dir" || ! -w "$dir" ]]; then
+    LOCK_FILE="$LOCK_FALLBACK"
+  fi
+}
+
+acquire_lock() {
+  select_lock_file
+  if ! eval "exec ${LOCK_FD}>\"$LOCK_FILE\""; then
+    echo "Unable to open lock file: $LOCK_FILE" >&2
+    exit 1
+  fi
+  if ! flock -n "$LOCK_FD"; then
+    log "Another instance is already running (lock: $LOCK_FILE). Exiting."
+    exit 0
+  fi
+  echo "$$" 1>&${LOCK_FD}
+  LOCK_HELD=1
 }
 
 check_association() {
@@ -125,6 +167,7 @@ report_status() {
 }
 
 main() {
+  acquire_lock
   log "Starting WiFi Auto-Recover on interface: $IFACE"
   disable_powersave
   local initial_dns_status="disabled" initial_route_status="no"
@@ -146,7 +189,7 @@ main() {
   local state="ok"
   local detail=""
 
-  while true; do
+  while (( should_run )); do
     local default_route_ok=0
     local default_route_status="no"
     local dns_status="disabled"
@@ -196,7 +239,7 @@ main() {
       fi
       fails=0
       last_state="ok"
-      sleep "$CHECK_INTERVAL_OK"
+      sleep "$CHECK_INTERVAL_OK" || true
     else
       if [[ "$state" == "$last_state" ]]; then
         ((fails++))
@@ -212,13 +255,17 @@ main() {
           userlog "Lost connection on $IFACE — starting recovery attempts."
         fi
         cycle_wifi
-        sleep "$RETRY_INTERVAL"
+        sleep "$RETRY_INTERVAL" || true
       else
-        sleep 5
+        sleep 5 || true
       fi
       last_state="$state"
     fi
   done
 }
+
+trap 'on_signal SIGINT' INT
+trap 'on_signal SIGTERM' TERM
+trap cleanup EXIT
 
 main
