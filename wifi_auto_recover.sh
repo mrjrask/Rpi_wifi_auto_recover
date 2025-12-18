@@ -16,7 +16,32 @@ RETRY_INTERVAL=60                  # seconds between recovery cycles
 MAX_FAILS=1                        # trigger recovery after this many fails
 ENABLE_DNS_CHECK=${ENABLE_DNS_CHECK:-1}  # set to 0 to skip DNS resolution check
 
-HOME_LOG="${HOME}/wifi_recovery.log"
+resolve_log_home() {
+  local candidate
+
+  if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+    candidate="$(getent passwd "$SUDO_USER" | awk -F: 'NR==1 {print $6}')"
+    if [[ -z "$candidate" || ! -d "$candidate" ]]; then
+      if [[ -d /home/pi ]]; then
+        candidate="/home/pi"
+      else
+        candidate="/root"
+      fi
+    fi
+    echo "$candidate"
+    return
+  fi
+
+  echo "${HOME:-/root}"
+}
+
+DEFAULT_LOG_HOME="$(resolve_log_home)"
+
+if [[ -n "${WIFI_RECOVERY_LOG:-}" ]]; then
+  HOME_LOG="${WIFI_RECOVERY_LOG/#~/$DEFAULT_LOG_HOME}"
+else
+  HOME_LOG="${DEFAULT_LOG_HOME}/wifi_recovery.log"
+fi
 
 LOCK_FILE="/var/lock/wifi_auto_recover.lock"
 LOCK_FALLBACK="${HOME}/.wifi_auto_recover.lock"
