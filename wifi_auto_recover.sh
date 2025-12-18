@@ -25,20 +25,21 @@ LOCK_HELD=0
 should_run=1
 
 detect_iface() {
+  if [[ -n "${WIFI_INTERFACE:-}" ]]; then
+    echo "$WIFI_INTERFACE"
+    return 0
+  fi
   if [[ $# -gt 0 && -n "${1:-}" ]]; then
     echo "$1"
-    return
+    return 0
   fi
   local first
   first="$(iw dev | awk '/Interface/ {print $2; exit}')"
   if [[ -z "$first" ]]; then
-    echo "No wireless interface found" >&2
-    exit 1
+    return 1
   fi
   echo "$first"
 }
-
-IFACE="$(detect_iface "${1:-}")"
 
 log() {
   local line
@@ -49,6 +50,13 @@ log() {
 userlog() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') [wifi-recovery] $*" >> "$HOME_LOG"
 }
+
+NO_INTERFACE_EXIT=12
+
+if ! IFACE="$(detect_iface "${1:-}")"; then
+  log "⚠️ No wireless interface found; exiting with status ${NO_INTERFACE_EXIT}."
+  exit "$NO_INTERFACE_EXIT"
+fi
 
 on_signal() {
   local sig=$1
