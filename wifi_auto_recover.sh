@@ -14,6 +14,7 @@ PING_TIMEOUT=2                     # seconds per ping
 CHECK_INTERVAL_OK=15               # seconds between healthy checks
 RETRY_INTERVAL=60                  # seconds between recovery cycles
 MAX_FAILS=1                        # trigger recovery after this many fails
+ENABLE_DNS_CHECK=${ENABLE_DNS_CHECK:-1}  # set to 0 to skip DNS resolution check
 
 HOME_LOG="${HOME}/wifi_recovery.log"
 
@@ -45,12 +46,43 @@ check_association() {
   iw dev "$IFACE" link | grep -q "Connected to"
 }
 
-check_internet() {
-  for h in "${PING_HOSTS[@]}"; do
-    if ping -I "$IFACE" -c 1 -W "$PING_TIMEOUT" "$h" >/dev/null 2>&1; then
+check_default_route() {
+  ip route show default dev "$IFACE" | grep -q .
+}
+
+ping_with_fallback() {
+  local host=$1 output rc
+  if output=$(ping -I "$IFACE" -c 1 -W "$PING_TIMEOUT" "$host" 2>&1); then
+    PING_LOG_DETAIL="Ping via $IFACE to $host succeeded."
+    return 0
+  fi
+  rc=$?
+  if [[ "$output" == *"Operation not permitted"* || "$output" == *"Permission denied"* ]]; then
+    if output=$(ping -c 1 -W "$PING_TIMEOUT" "$host" 2>&1); then
+      PING_LOG_DETAIL="Ping fallback (no interface binding) to $host succeeded."
       return 0
     fi
+  fi
+  PING_LOG_DETAIL="$output"
+  return "$rc"
+}
+
+check_ping_hosts() {
+  PING_FAILURE_DETAIL=""
+  for h in "${PING_HOSTS[@]}"; do
+    if ping_with_fallback "$h"; then
+      return 0
+    fi
+    PING_FAILURE_DETAIL="Ping failed to $h (${PING_LOG_DETAIL:-no details}); hosts tried: ${PING_HOSTS[*]}"
   done
+  return 1
+}
+
+check_dns() {
+  if getent hosts dns.google >/dev/null 2>&1; then
+    return 0
+  fi
+  DNS_FAILURE_DETAIL="DNS resolution failed for dns.google"
   return 1
 }
 
@@ -85,10 +117,29 @@ main() {
 
   local fails=0
   local recovery_start=0
+  local last_state="ok"
+  local state="ok"
+  local detail=""
 
   while true; do
-    if check_association && check_internet; then
-      # Connected
+    detail="Connectivity verified."
+    if ! check_association; then
+      state="no_wifi"
+      detail="WiFi not associated on $IFACE (iw dev link)."
+    elif ! check_default_route; then
+      state="no_internet"
+      detail="No default route via $IFACE."
+    elif ! check_ping_hosts; then
+      state="no_internet"
+      detail="${PING_FAILURE_DETAIL:-Ping check failed.}"
+    elif [[ "$ENABLE_DNS_CHECK" -eq 1 ]] && ! check_dns; then
+      state="no_internet"
+      detail="${DNS_FAILURE_DETAIL:-DNS check failed.}"
+    else
+      state="ok"
+    fi
+
+    if [[ "$state" == "ok" ]]; then
       if (( recovery_start > 0 )); then
         local recovery_end
         recovery_end=$(date +%s)
@@ -99,24 +150,28 @@ main() {
         recovery_start=0
       fi
       fails=0
+      last_state="ok"
       sleep "$CHECK_INTERVAL_OK"
-      continue
-    fi
-
-    # Not connected
-    ((fails++))
-    log "Connectivity check failed (${fails}/${MAX_FAILS})."
-    report_status
-
-    if (( fails >= MAX_FAILS )); then
-      if (( recovery_start == 0 )); then
-        recovery_start=$(date +%s)
-        userlog "Lost connection on $IFACE — starting recovery attempts."
-      fi
-      cycle_wifi
-      sleep "$RETRY_INTERVAL"
     else
-      sleep 5
+      if [[ "$state" == "$last_state" ]]; then
+        ((fails++))
+      else
+        fails=1
+      fi
+      log "Connectivity state=${state} (${fails}/${MAX_FAILS}): ${detail}"
+      report_status
+
+      if (( fails >= MAX_FAILS )); then
+        if (( recovery_start == 0 )); then
+          recovery_start=$(date +%s)
+          userlog "Lost connection on $IFACE — starting recovery attempts."
+        fi
+        cycle_wifi
+        sleep "$RETRY_INTERVAL"
+      else
+        sleep 5
+      fi
+      last_state="$state"
     fi
   done
 }
