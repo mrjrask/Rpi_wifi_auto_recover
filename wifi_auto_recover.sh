@@ -15,6 +15,8 @@ CHECK_INTERVAL_OK=15               # seconds between healthy checks
 RETRY_INTERVAL=60                  # seconds between recovery cycles
 MAX_FAILS=1                        # trigger recovery after this many fails
 ENABLE_DNS_CHECK=${ENABLE_DNS_CHECK:-1}  # set to 0 to skip DNS resolution check
+STATUS_MODE=0
+IFACE_ARG=""
 
 resolve_log_home() {
   local candidate
@@ -49,6 +51,55 @@ LOCK_FD=200
 LOCK_HELD=0
 should_run=1
 
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --status)
+        STATUS_MODE=1
+        ;;
+      -h|--help)
+        cat <<EOF
+Usage: $0 [--status] [interface]
+
+Options:
+  --status   Print last known connectivity status and exit.
+  -h, --help Show this help message and exit.
+
+Positional:
+  interface  WiFi interface to monitor (defaults to auto-detected).
+EOF
+        exit 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        echo "Unknown option: $1" >&2
+        exit 1
+        ;;
+      *)
+        if [[ -z "$IFACE_ARG" ]]; then
+          IFACE_ARG="$1"
+        else
+          echo "Unexpected argument: $1" >&2
+          exit 1
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  if [[ $# -gt 0 ]]; then
+    if [[ -z "$IFACE_ARG" ]]; then
+      IFACE_ARG="$1"
+    else
+      echo "Unexpected argument: $1" >&2
+      exit 1
+    fi
+  fi
+}
+
 detect_iface() {
   if [[ -n "${WIFI_INTERFACE:-}" ]]; then
     echo "$WIFI_INTERFACE"
@@ -78,9 +129,16 @@ userlog() {
 
 NO_INTERFACE_EXIT=12
 
-if ! IFACE="$(detect_iface "${1:-}")"; then
+parse_args "$@"
+
+if ! IFACE="$(detect_iface "$IFACE_ARG")"; then
   log "⚠️ No wireless interface found; exiting with status ${NO_INTERFACE_EXIT}."
   exit "$NO_INTERFACE_EXIT"
+fi
+
+if (( STATUS_MODE )); then
+  status_mode
+  exit 0
 fi
 
 on_signal() {
@@ -197,6 +255,137 @@ report_status() {
   freq="${freq:-unknown}"
   tx_bitrate="${tx_bitrate:-unknown}"
   log "Status: SSID=${ssid}, BSSID=${bssid}, Signal=${signal} dBm, Freq=${freq} MHz, TX=${tx_bitrate}, IP=${ipaddr:-none}, DefaultRoute=${default_route_status}, DNS=${dns_status}"
+}
+
+parse_timestamp() {
+  local line_ts
+  line_ts="${1:0:19}"
+  date -d "$line_ts" +%s 2>/dev/null || echo ""
+}
+
+latest_log_line() {
+  local regex="$1" latest_line="" latest_epoch=0 log_file line epoch
+  for log_file in "$HOME_LOG" /var/log/wifi_auto_recover.log; do
+    [[ -f "$log_file" ]] || continue
+    line=$(grep -Eh "$regex" "$log_file" 2>/dev/null | tail -n 1 || true)
+    [[ -z "$line" ]] && continue
+    epoch=$(parse_timestamp "$line")
+    [[ -z "$epoch" ]] && continue
+    if (( epoch > latest_epoch )); then
+      latest_epoch=$epoch
+      latest_line="$line"
+    fi
+  done
+  printf '%s' "$latest_line"
+}
+
+extract_log_metadata() {
+  LOG_STATE=""
+  LOG_SSID=""
+  LOG_IP=""
+  LOG_RECOVERY_DURATION=""
+
+  local state_line status_line recovery_line
+  state_line=$(latest_log_line "Connectivity state=")
+  if [[ -n "$state_line" ]]; then
+    LOG_STATE="$(sed -n 's/.*state=\([^ ]*\).*/\1/p' <<<"$state_line")"
+  fi
+
+  status_line=$(latest_log_line "Status: SSID=")
+  if [[ -n "$status_line" ]]; then
+    LOG_SSID="$(sed -n 's/.*SSID=\([^,]*\),.*/\1/p' <<<"$status_line")"
+    LOG_IP="$(sed -n 's/.*IP=\([^,]*\),.*/\1/p' <<<"$status_line")"
+  fi
+
+  recovery_line=$(latest_log_line "Recovered connection|Connectivity restored after")
+  if [[ -n "$recovery_line" ]]; then
+    LOG_RECOVERY_DURATION="$(sed -n 's/.*after \([0-9]\+\)s.*/\1/p' <<<"$recovery_line")"
+  fi
+}
+
+run_one_shot_check() {
+  local state="ok" detail="Connectivity verified." default_route_ok=0 dns_status="disabled"
+
+  if ! check_association; then
+    state="no_wifi"
+    detail="WiFi not associated on $IFACE (iw dev link)."
+  fi
+
+  if [[ "$state" == "ok" ]]; then
+    if check_default_route; then
+      default_route_ok=1
+    else
+      state="no_internet"
+      detail="No default route via $IFACE."
+    fi
+  fi
+
+  if [[ "$state" == "ok" ]] && ! check_ping_hosts; then
+    state="no_internet"
+    detail="${PING_FAILURE_DETAIL:-Ping check failed.}"
+  fi
+
+  if [[ "$ENABLE_DNS_CHECK" -eq 1 ]]; then
+    dns_status="no"
+    if check_dns; then
+      dns_status="yes"
+    fi
+    if [[ "$state" == "ok" && "$dns_status" != "yes" ]]; then
+      state="no_internet"
+      detail="${DNS_FAILURE_DETAIL:-DNS check failed.}"
+    fi
+  fi
+
+  local ssid ipaddr
+  ssid="$(iwgetid -r 2>/dev/null || echo '?')"
+  ipaddr="$(ip -4 addr show dev "$IFACE" | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)"
+
+  ONE_SHOT_STATE="$state"
+  ONE_SHOT_SSID="${ssid:-unknown}"
+  ONE_SHOT_IP="${ipaddr:-none}"
+  ONE_SHOT_DETAIL="$detail"
+  ONE_SHOT_DNS="$dns_status"
+}
+
+status_mode() {
+  extract_log_metadata
+  run_one_shot_check
+
+  local state_source="one-shot check" ssid ipaddr state
+  state="$ONE_SHOT_STATE"
+  ssid="$ONE_SHOT_SSID"
+  ipaddr="$ONE_SHOT_IP"
+
+  if [[ -z "$state" && -n "$LOG_STATE" ]]; then
+    state_source="logs"
+    state="$LOG_STATE"
+  elif [[ -z "$state" ]]; then
+    state_source="unknown"
+    state="unknown"
+  fi
+
+  if [[ -z "$ssid" && -n "$LOG_SSID" ]]; then
+    ssid="$LOG_SSID"
+  fi
+
+  if [[ -z "$ipaddr" && -n "$LOG_IP" ]]; then
+    ipaddr="$LOG_IP"
+  fi
+
+  echo "WiFi Auto-Recover status for interface: $IFACE"
+  echo "State: ${state:-unknown} (${state_source})"
+  echo "SSID: ${ssid:-unknown}"
+  echo "IP: ${ipaddr:-unknown}"
+  if [[ -n "$LOG_RECOVERY_DURATION" ]]; then
+    echo "Last recovery duration: ${LOG_RECOVERY_DURATION}s"
+  else
+    echo "Last recovery duration: unknown (no recovery logged)"
+  fi
+  if [[ -n "$ONE_SHOT_DETAIL" ]]; then
+    echo "Detail: $ONE_SHOT_DETAIL"
+  elif [[ -n "$LOG_STATE" ]]; then
+    echo "Detail: last logged state=$LOG_STATE"
+  fi
 }
 
 main() {
